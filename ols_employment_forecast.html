@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Seasonal OLS Employment Forecaster (quarterly)</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<style>
+:root{--bg:#f5f7f8;--card:#fff;--ink:#14232b;--mut:#5d6f78;--line:#d5dde1;--acc:#0b6e6e;--acc2:#c2410c}
+@media(prefers-color-scheme:dark){:root{--bg:#0f1a1f;--card:#16252c;--ink:#e6eef1;--mut:#93a6af;--line:#2b3f48;--acc:#4fc3c3;--acc2:#fb923c}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 Georgia,serif}
+main{max-width:1050px;margin:0 auto;padding:24px 16px 60px}
+h1{font-size:1.7rem;margin:0 0 4px}h2{font-size:1.1rem;margin:0 0 10px}
+p.sub{color:var(--mut);margin:0 0 20px}
+section{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:16px;margin-bottom:16px}
+label,button,select,input,table{font-family:system-ui,sans-serif;font-size:14px}
+select,input[type=text],input[type=number]{padding:6px;border:1px solid var(--line);border-radius:4px;background:var(--bg);color:var(--ink)}
+input[type=number]{width:90px}
+button{padding:8px 16px;border:0;border-radius:4px;background:var(--acc);color:var(--bg);cursor:pointer;font-weight:600}
+button.g{background:transparent;color:var(--acc);border:1px solid var(--acc)}
+:focus-visible{outline:2px solid var(--acc2);outline-offset:2px}
+.row{display:flex;flex-wrap:wrap;gap:14px;align-items:center;margin-bottom:10px}
+.vars{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:6px}
+.vars label{border:1px solid var(--line);border-radius:4px;padding:6px 8px;display:flex;gap:6px;align-items:center}
+.tag{color:var(--mut);font-size:12px;margin-left:auto}
+.wrap{overflow-x:auto}
+table{border-collapse:collapse;width:100%}
+th,td{padding:6px 10px;border-bottom:1px solid var(--line);text-align:right;white-space:nowrap}
+th:first-child,td:first-child{text-align:left}
+th{color:var(--mut);font-weight:600}
+.stats{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin-bottom:14px}
+.stat{border-left:3px solid var(--acc);padding-left:10px;font-family:system-ui,sans-serif}
+.stat b{display:block;font-size:1.15rem}.stat span{color:var(--mut);font-size:12px}
+.sig{color:var(--acc);font-weight:700}.err{color:var(--acc2)}
+canvas{width:100%;height:300px;display:block}
+.note{color:var(--mut);font-size:13px;font-family:system-ui,sans-serif}
+td input[type=number]{width:80px}
+</style></head><body><main>
+<h1>Seasonal OLS employment forecaster</h1>
+<p class="sub">Quarterly data in, two-year forecast out. The model uses quarter dummies for the seasonal pattern, an optional time trend, and any indicator or driver variables you choose.</p>
+
+<section><h2>1. Data</h2>
+<div class="row"><input type="file" id="file" accept=".csv,.xlsx,.xls" aria-label="Data file">
+<button class="g" id="demo">Load sample data</button><span id="info" class="note"></span></div>
+<div class="wrap" id="preview"></div></section>
+
+<section id="setup" hidden><h2>2. Model</h2>
+<div class="row"><label>Employment (dependent)&nbsp;<select id="dep"></select></label>
+<label>Quarter column&nbsp;<select id="per"></select></label></div>
+<div class="row"><span class="note">If the quarter column can't be read (formats like 2019 Q1, Q1-2019, 2019Q1 or dates work), the first row is taken as:</span>
+<label>year&nbsp;<input type="number" id="y0" value="2013"></label><label>quarter&nbsp;<select id="q0"><option>1</option><option>2</option><option>3</option><option>4</option></select></label></div>
+<div class="row"><label><input type="checkbox" id="seas" checked> Seasonal quarter dummies (Q1 is the baseline)</label>
+<label><input type="checkbox" id="trend" checked> Linear time trend</label>
+<label><input type="checkbox" id="lag"> Add lagged employment (t-1)</label></div>
+<div class="row"><label>Forecast horizon (quarters)&nbsp;<input type="number" id="hor" value="8" min="1" max="20"></label>
+<label>Future values of drivers&nbsp;<select id="meth"><option value="trend">Extrapolate recent trend</option><option value="last">Hold last value</option></select></label></div>
+<p class="note">Other explanatory variables (drivers and indicators). Text columns become indicator dummies automatically; numeric 0/1 columns are used as indicators.</p>
+<div class="vars" id="vars"></div>
+<div class="row" style="margin-top:14px"><button id="run">Estimate and forecast</button><span id="msg" class="err"></span></div></section>
+
+<section id="out" hidden><h2>3. Statistical parameters</h2>
+<div class="stats" id="stats"></div>
+<div class="wrap"><table id="coef"></table></div>
+<p class="note">Significance: *** p&lt;0.01, ** p&lt;0.05, * p&lt;0.10. Std. beta is the coefficient scaled by sd(x)/sd(y). Quarter dummy coefficients are the seasonal difference from Q1, in employment units.</p></section>
+
+<section id="fc" hidden><h2>4. Forecast</h2>
+<p class="note">Driver values are pre-filled and can be edited; click "Recalculate" after changing them. Intervals are 95% prediction intervals.</p>
+<div class="wrap"><table id="ftab"></table></div>
+<div class="row" style="margin-top:10px"><button id="fbtn">Recalculate</button><button class="g" id="dl">Download forecast CSV</button></div>
+<canvas id="cv"></canvas></section>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+let rows=[],cols=[],type={},M=null,FC=[];
+
+/* ---------- special functions ---------- */
+function lgam(x){const c=[76.18009172947146,-86.50532032941677,24.01409824083091,-1.231739572450155,.1208650973866179e-2,-.5395239384953e-5];let y=x,t=x+5.5;t-=(x+.5)*Math.log(t);let s=1.000000000190015;for(const k of c)s+=k/++y;return -t+Math.log(2.5066282746310005*s/x)}
+function betacf(a,b,x){let qab=a+b,qap=a+1,qam=a-1,c=1,d=1-qab*x/qap;if(Math.abs(d)<1e-30)d=1e-30;d=1/d;let h=d;
+ for(let m=1;m<=300;m++){let m2=2*m,aa=m*(b-m)*x/((qam+m2)*(a+m2));d=1+aa*d;if(Math.abs(d)<1e-30)d=1e-30;c=1+aa/c;if(Math.abs(c)<1e-30)c=1e-30;d=1/d;h*=d*c;
+ aa=-(a+m)*(qab+m)*x/((a+m2)*(qap+m2));d=1+aa*d;if(Math.abs(d)<1e-30)d=1e-30;c=1+aa/c;if(Math.abs(c)<1e-30)c=1e-30;d=1/d;const del=d*c;h*=del;if(Math.abs(del-1)<3e-10)break}return h}
+function ibeta(x,a,b){if(x<=0)return 0;if(x>=1)return 1;const bt=Math.exp(lgam(a+b)-lgam(a)-lgam(b)+a*Math.log(x)+b*Math.log(1-x));
+ return x<(a+1)/(a+b+2)?bt*betacf(a,b,x)/a:1-bt*betacf(b,a,1-x)/b}
+const pT=(t,df)=>ibeta(df/(df+t*t),df/2,.5),pF=(f,d1,d2)=>ibeta(d2/(d2+d1*f),d2/2,d1/2);
+function tcrit(df){let lo=0,hi=100;for(let i=0;i<80;i++){const m=(lo+hi)/2;pT(m,df)>.05?lo=m:hi=m}return(lo+hi)/2}
+function inv(A){const n=A.length,M=A.map((r,i)=>[...r,...Array.from({length:n},(_,j)=>+(i===j))]);
+ for(let i=0;i<n;i++){let p=i;for(let r=i+1;r<n;r++)if(Math.abs(M[r][i])>Math.abs(M[p][i]))p=r;
+  if(Math.abs(M[p][i])<1e-12)return null;[M[i],M[p]]=[M[p],M[i]];const d=M[i][i];for(let j=0;j<2*n;j++)M[i][j]/=d;
+  for(let r=0;r<n;r++)if(r!==i){const f=M[r][i];if(f)for(let j=0;j<2*n;j++)M[r][j]-=f*M[i][j]}}
+ return M.map(r=>r.slice(n))}
+const mean=a=>a.reduce((s,v)=>s+v,0)/a.length,sd=a=>{const m=mean(a);return Math.sqrt(a.reduce((s,v)=>s+(v-m)**2,0)/(a.length-1))};
+const f4=v=>Math.abs(v)>=1e5||(Math.abs(v)<1e-3&&v!==0)?v.toExponential(3):v.toFixed(4),fmtP=p=>p<1e-4?'<0.0001':p.toFixed(4);
+
+/* ---------- quarter parsing ---------- */
+function parseQ(v){
+ if(v==null||v==="")return null;
+ if(typeof v==='number'){if(v>20000&&v<80000){const d=new Date((v-25569)*864e5);return[d.getUTCFullYear(),Math.floor(d.getUTCMonth()/3)+1]}return null}
+ const s=String(v);let m=s.match(/(\d{4})\D*Q\s*([1-4])/i)||s.match(/Q\s*([1-4])\D*(\d{4})/i);
+ if(m)return/^\d{4}$/.test(m[1])?[+m[1],+m[2]]:[+m[2],+m[1]];
+ m=s.match(/(\d{4})\D+([1-4])$/);if(m&&+m[2]<=4&&s.length<=8)return[+m[1],+m[2]];
+ const d=new Date(s);return isNaN(d)?null:[d.getFullYear(),Math.floor(d.getMonth()/3)+1]}
+const lab=(t,o)=>{const k=o.q0-1+t;return`${o.y0+Math.floor(k/4)} Q${k%4+1}`};
+const qOf=(t,o)=>(o.q0-1+t)%4+1;
+
+/* ---------- data loading ---------- */
+function load(data){
+ rows=data;cols=Object.keys(data[0]||{});type={};
+ cols.forEach(c=>{const v=rows.map(r=>r[c]).filter(x=>x!==null&&x!=="");const num=v.filter(x=>typeof x==='number'||(x!==""&&!isNaN(+x))).length;type[c]=v.length&&num/v.length>=.9?'num':'cat'});
+ rows.forEach(r=>cols.forEach(c=>{if(type[c]==='num')r[c]=(r[c]===null||r[c]===""||isNaN(+r[c]))?null:+r[c]}));
+ $('info').textContent=`${rows.length} rows, ${cols.length} columns`;
+ $('preview').innerHTML='<table><tr>'+cols.map(c=>`<th>${c}</th>`).join('')+'</tr>'+rows.slice(0,5).map(r=>'<tr>'+cols.map(c=>`<td>${r[c]??''}</td>`).join('')+'</tr>').join('')+'</table>';
+ const nums=cols.filter(c=>type[c]==='num');
+ $('dep').innerHTML=nums.map(c=>`<option>${c}</option>`).join('');
+ const g=nums.find(c=>/employ|jobs|payroll/i.test(c));if(g)$('dep').value=g;
+ $('per').innerHTML='<option value="">(none: use start quarter below)</option>'+cols.map(c=>`<option>${c}</option>`).join('');
+ const dt=cols.find(c=>/date|quarter|period|time/i.test(c)&&rows.slice(0,5).every(r=>parseQ(r[c])));if(dt)$('per').value=dt;
+ drawVars();$('setup').hidden=false;$('out').hidden=true;$('fc').hidden=true}
+function drawVars(){const d=$('dep').value,p=$('per').value;
+ $('vars').innerHTML=cols.filter(c=>c!==d&&c!==p).map(c=>{
+  const ind=type[c]==='num'&&rows.every(r=>r[c]===null||r[c]===0||r[c]===1);
+  const isQ=type[c]==='cat'&&rows.every(r=>/^Q[1-4]$/i.test(String(r[c])));
+  return`<label><input type="checkbox" value="${c}" ${type[c]==='num'&&!/^(year|qtr|quarter)$/i.test(c)?'checked':''}>${c}<span class="tag">${isQ?'quarter label (use dummies above)':type[c]==='cat'?'text → dummies':ind?'indicator 0/1':'numeric'}</span></label>`}).join('')}
+$('dep').onchange=$('per').onchange=drawVars;
+$('file').onchange=e=>{const fl=e.target.files[0];if(!fl)return;const rd=new FileReader();
+ rd.onload=ev=>{try{const wb=XLSX.read(new Uint8Array(ev.target.result),{type:'array'});
+  const d=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{defval:null,raw:true});if(!d.length)throw 0;load(d)}
+  catch(x){$('info').textContent='Could not read that file. Use a table with a header row.'}};rd.readAsArrayBuffer(fl)};
+$('demo').onclick=()=>{const d=[];let s=7;const rnd=()=>(s=(s*16807)%2147483647)/2147483647,sea=[0,6,14,-4];
+ for(let i=0;i<48;i++){const gdp=100+i*.6+rnd()*3,ur=6-i*.05+rnd()*.6,rec=i>=20&&i<26?1:0;
+  d.push({Quarter:`${2013+Math.floor(i/4)} Q${i%4+1}`,Employment:Math.round(900+4.2*gdp-18*ur-35*rec+sea[i%4]+rnd()*6),GDP_index:+gdp.toFixed(1),Unemployment_rate:+ur.toFixed(2),Recession:rec})}
+ load(d)};
+
+/* ---------- estimation ---------- */
+$('run').onclick=()=>{
+ $('msg').textContent='';
+ const dep=$('dep').value,per=$('per').value,sel=[...document.querySelectorAll('#vars input:checked')].map(i=>i.value);
+ const seas=$('seas').checked,tr=$('trend').checked,lag=$('lag').checked,H=Math.max(1,Math.min(20,+$('hor').value||8));
+ // time index
+ let o={y0:+$('y0').value,q0:+$('q0').value},ts=rows.map((_,i)=>i);
+ if(per){const p=rows.map(r=>parseQ(r[per]));
+  if(p.every(x=>x)){o={y0:p[0][0],q0:p[0][1]};ts=p.map(x=>(x[0]-o.y0)*4+x[1]-o.q0)}
+  else{$('msg').textContent='Quarter column not readable, using the start quarter you entered.'}}
+ let obs=rows.map((r,i)=>({r,t:ts[i]})).sort((a,b)=>a.t-b.t);
+ obs.forEach((x,i)=>{x.prev=i&&obs[i-1].t===x.t-1?obs[i-1].r[dep]:null});
+ obs=obs.filter(x=>x.r[dep]!==null&&sel.every(c=>x.r[c]!==null&&x.r[c]!=="")&&(!lag||x.prev!==null));
+ const spec=[{name:'Intercept',f:x=>1}];
+ if(tr)spec.push({name:'Trend (per quarter)',f:x=>x.t});
+ if(seas)[2,3,4].forEach(k=>spec.push({name:`Quarter Q${k}`,f:x=>+(qOf(x.t,o)===k)}));
+ if(lag)spec.push({name:dep+' (t-1)',f:x=>x.prev});
+ sel.forEach(c=>{if(type[c]==='num')spec.push({name:c,src:c,f:x=>x.r[c]});else{
+  [...new Set(obs.map(x=>String(x.r[c])))].sort().slice(1).forEach(l=>spec.push({name:`${c}=${l}`,src:c,f:x=>+(String(x.r[c])===l)}))}});
+ const k=spec.length,n=obs.length;
+ if(n<=k){$('msg').textContent=`Need more observations (${n}) than parameters (${k}).`;return}
+ if(seas&&n<12)$('msg').textContent='Warning: under 3 years of data makes seasonal estimates unreliable.';
+ const X=obs.map(x=>spec.map(s=>s.f(x))),y=obs.map(x=>x.r[dep]);
+ const XtXi=inv(Array.from({length:k},(_,a)=>Array.from({length:k},(_,b)=>X.reduce((s,x)=>s+x[a]*x[b],0))));
+ if(!XtXi){$('msg').textContent='Perfect multicollinearity: remove a redundant variable (for example a Quarter text column while quarter dummies are on, or a Year column with the trend on).';return}
+ const Xty=Array.from({length:k},(_,a)=>X.reduce((s,x,i)=>s+x[a]*y[i],0)),b=XtXi.map(r=>r.reduce((s,v,j)=>s+v*Xty[j],0));
+ const fit=X.map(x=>x.reduce((s,v,j)=>s+v*b[j],0)),e=y.map((v,i)=>v-fit[i]);
+ const sse=e.reduce((s,v)=>s+v*v,0),ym=mean(y),sst=y.reduce((s,v)=>s+(v-ym)**2,0),df=n-k,s2=sse/df;
+ const se=b.map((_,i)=>Math.sqrt(s2*XtXi[i][i])),t=b.map((v,i)=>v/se[i]),p=t.map(v=>pT(v,df)),tc=tcrit(df),sdy=sd(y);
+ const std=spec.map((s,i)=>i?b[i]*sd(X.map(x=>x[i]))/sdy:null);
+ const r2=1-sse/sst,adj=1-(1-r2)*(n-1)/df,d1=k-1,F=d1>0?((sst-sse)/d1)/s2:null;
+ const dw=e.slice(1).reduce((s,v,i)=>s+(v-e[i])**2,0)/sse,ll=-n/2*(Math.log(2*Math.PI*sse/n)+1);
+ M={spec,b,se,t,p,tc,XtXi,s2,df,n,k,dep,sel,obs,y,fit,o,H,lag,tr};
+ const S=[['Observations',n],['R²',r2.toFixed(4)],['Adj. R²',adj.toFixed(4)],['F-statistic',F?F.toFixed(2):'n/a'],['Prob (F)',F?fmtP(pF(F,d1,df)):'n/a'],
+  ['Std. error of regression',Math.sqrt(s2).toFixed(3)],['Durbin-Watson',dw.toFixed(3)],['AIC',(2*k-2*ll).toFixed(1)],['BIC',(k*Math.log(n)-2*ll).toFixed(1)],['Residual d.f.',df],['Sample',`${lab(obs[0].t,o)} to ${lab(obs[n-1].t,o)}`]];
+ $('stats').innerHTML=S.map(([l,v])=>`<div class="stat"><b>${v}</b><span>${l}</span></div>`).join('');
+ $('coef').innerHTML='<tr><th>Variable</th><th>Coefficient (β)</th><th>Std. error</th><th>t-stat</th><th>p-value</th><th>95% CI low</th><th>95% CI high</th><th>Std. beta</th></tr>'+
+  spec.map((s,i)=>`<tr><td>${s.name}</td><td>${f4(b[i])}</td><td>${f4(se[i])}</td><td>${t[i].toFixed(3)}</td><td class="${p[i]<.05?'sig':''}">${fmtP(p[i])} ${p[i]<.01?'***':p[i]<.05?'**':p[i]<.1?'*':''}</td><td>${f4(b[i]-tc*se[i])}</td><td>${f4(b[i]+tc*se[i])}</td><td>${std[i]==null?'':std[i].toFixed(3)}</td></tr>`).join('');
+ $('out').hidden=false;buildForecast();$('fbtn').onclick();$('out').scrollIntoView({behavior:'smooth'})};
+
+/* ---------- forecast ---------- */
+function buildForecast(){
+ const last=M.obs[M.n-1],T=last.t,meth=$('meth').value,rec=M.obs.slice(-12);
+ const ext=c=>{const ind=M.obs.every(x=>x.r[c]===0||x.r[c]===1);
+  if(type[c]!=='num'||ind||meth==='last'||rec.length<4)return h=>last.r[c];
+  const mt=mean(rec.map(x=>x.t)),mv=mean(rec.map(x=>x.r[c])),sl=rec.reduce((s,x)=>s+(x.t-mt)*(x.r[c]-mv),0)/rec.reduce((s,x)=>s+(x.t-mt)**2,0);
+  return h=>+(mv+sl*(T+h-mt)).toFixed(3)};
+ const fns=M.sel.map(ext);
+ $('ftab').innerHTML='<thead><tr><th>Quarter</th>'+M.sel.map(c=>`<th>${c}</th>`).join('')+'<th>Forecast</th><th>Lower 95%</th><th>Upper 95%</th></tr></thead><tbody id="fb">'+
+  Array.from({length:M.H},(_,i)=>`<tr><td>${lab(T+i+1,M.o)}</td>`+M.sel.map((c,j)=>`<td><input ${type[c]==='num'?'type="number" step="any"':'type="text" size="8"'} value="${fns[j](i+1)}"></td>`).join('')+'<td></td><td></td><td></td></tr>').join('')+'</tbody>';
+ $('fc').hidden=false}
+$('fbtn').onclick=()=>{
+ const T=M.obs[M.n-1].t;FC=[];let prev=M.y[M.n-1];
+ [...$('fb').rows].forEach((tr,i)=>{
+  const r={};M.sel.forEach((c,j)=>{const v=tr.cells[j+1].firstChild.value;r[c]=type[c]==='num'?+v:v});
+  const x={t:T+i+1,r,prev},v=M.spec.map(s=>s.f(x)),yh=v.reduce((s,a,j)=>s+a*M.b[j],0);
+  const q=v.reduce((s,a,i2)=>s+a*v.reduce((u,c2,j)=>u+M.XtXi[i2][j]*c2,0),0),sp=Math.sqrt(M.s2*(1+q));
+  const nc=tr.cells.length;[yh,yh-M.tc*sp,yh+M.tc*sp].forEach((val,j)=>tr.cells[nc-3+j].textContent=val.toFixed(1));
+  FC.push({label:tr.cells[0].textContent,yh,lo:yh-M.tc*sp,hi:yh+M.tc*sp});prev=yh});
+ drawChart()};
+$('meth').onchange=()=>{if(M){buildForecast();$('fbtn').onclick()}};
+$('dl').onclick=()=>{const c='Quarter,Forecast,Lower95,Upper95\n'+FC.map(o=>[o.label,o.yh,o.lo,o.hi].join(',')).join('\n');
+ const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([c],{type:'text/csv'}));a.download='employment_forecast.csv';a.click()};
+
+/* ---------- chart ---------- */
+function drawChart(){
+ const cv=$('cv'),dpr=devicePixelRatio||1,W=cv.clientWidth,H=cv.clientHeight;cv.width=W*dpr;cv.height=H*dpr;
+ const g=cv.getContext('2d');g.scale(dpr,dpr);g.clearRect(0,0,W,H);
+ const st=getComputedStyle(document.documentElement),col=n=>st.getPropertyValue(n).trim(),fc=FC,N=M.n,T=N+fc.length;
+ const all=[...M.y,...M.fit,...fc.flatMap(o=>[o.lo,o.hi])],mn=Math.min(...all),mx=Math.max(...all),pad=40;
+ const X=i=>pad+i*(W-pad-10)/Math.max(T-1,1),Y=v=>H-26-(v-mn)/(mx-mn||1)*(H-44);
+ g.font='12px system-ui';g.fillStyle=col('--mut');g.strokeStyle=col('--line');
+ for(let i=0;i<=4;i++){const v=mn+(mx-mn)*i/4,y=Y(v);g.beginPath();g.moveTo(pad,y);g.lineTo(W-10,y);g.stroke();g.fillText(v.toFixed(0),0,y+4)}
+ [0,N,T-1].forEach(i=>{const s=i<N?lab(M.obs[i].t,M.o):fc[i-N].label;g.textAlign=i===T-1?'right':'left';g.fillText(s,X(i),H-8)});g.textAlign='left';
+ const line=(a,c,dash,off=0)=>{g.beginPath();g.setLineDash(dash);g.strokeStyle=c;g.lineWidth=2;a.forEach((v,i)=>i?g.lineTo(X(i+off),Y(v)):g.moveTo(X(off),Y(v)));g.stroke();g.setLineDash([])};
+ line(M.y,col('--ink'),[]);line(M.fit,col('--acc'),[4,3]);
+ if(fc.length){line([M.fit[N-1],...fc.map(o=>o.yh)],col('--acc2'),[],N-1);
+  g.fillStyle=col('--acc2');g.globalAlpha=.18;g.beginPath();g.moveTo(X(N),Y(fc[0].hi));fc.forEach((o,i)=>g.lineTo(X(N+i),Y(o.hi)));[...fc].reverse().forEach((o,i)=>g.lineTo(X(T-1-i),Y(o.lo)));g.fill();g.globalAlpha=1}
+ g.fillStyle=col('--ink');g.fillText('— actual',pad+8,12);g.fillStyle=col('--acc');g.fillText('- - fitted',pad+70,12);g.fillStyle=col('--acc2');g.fillText('— forecast (shaded: 95% interval)',pad+140,12)}
+addEventListener('resize',()=>{if(M&&FC.length)drawChart()});
+</script></body></html>
